@@ -72,6 +72,22 @@ data folder (**Logs**).
 If XCL exits with an error, the bottom bar shows the reason (the `CRASH:` or `xcl:` line) with a
 **Show output** button.
 
+### Shader compiling while a game runs
+
+XCL compiles shaders and builds pipelines on demand while a game runs. The launcher reads the
+game's `xcl.log` as it grows and shows that work under **Stop** in the game's panel and in the
+bottom bar:
+
+- **Warm-up bar**: at startup, XCL builds the pipelines an earlier run used ("at least 512 of 787").
+  XCL only logs this count at 1, 2, 4, 8 …, so the bar is a lower bound and usually stops short
+  of the end, even when the warm-up has finished.
+- **Pipelines built** this run (compute pipelines, plus graphics pipelines large enough for XCL to log).
+- **Large ones compiling now**: pipelines in the GPU driver's compiler. While there are any, the
+  tile shows **Compiling shaders** instead of **Running**.
+
+There's no overall percentage while playing: shaders are compiled the moment the game first needs
+them, so there's no total to measure against. Use **Precompile shaders** to do that work ahead of time.
+
 ## Settings
 
 **Settings** (top right) holds:
@@ -178,8 +194,15 @@ XCL's cache, so the first run doesn't wait for them. It runs
 xcl shaders <pack> --precompile --only cs --pipelines [--used-only]
 ```
 
-for every `shaders.rpf` in the game folder, one after another, without a console window. Progress
-is shown at the bottom, and the output is saved to `<title>.precompile.log` in the launcher's logs.
+for every `shaders.rpf` in the game folder, one after another, without a console window. The output
+is saved to `<title>.precompile.log` in the launcher's logs.
+
+A **progress bar** in the game's panel and in the bottom bar shows how many of the pack's shaders
+are done (pipelines are built as part of each shader), plus the number of pipelines built, the
+time so far and an estimate of the time left. XCL reports the count every 200 shaders, and the
+biggest programs can take minutes each. When the count hasn't moved for 30 seconds, the estimate
+gives way to "compiling large shaders", and the spinner shows XCL is still at work. When it
+finishes, the bottom bar shows XCL's summary (compiled, already cached, errors, pipelines made).
 It's resumable: shaders already in the cache are skipped. **Only pipelines used before** adds
 `--used-only`, which is much faster once you've played the game for a while.
 

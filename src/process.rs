@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
@@ -118,6 +118,12 @@ pub struct Running {
     pub started: Instant,
     /// What XCL printed to its console.
     pub output: PathBuf,
+    /// The shader and pipeline work XCL logs while the game runs.
+    pub shaders: RunShaders,
+    /// XCL's own log of this run, read as it grows.
+    xcl_log: PathBuf,
+    launched: SystemTime,
+    tail: LogTail,
 }
 
 /// How a process ended.
@@ -154,6 +160,11 @@ impl Running {
             };
         }
         let output = logs.join(format!("{}.log", game.title));
+        let xcl_log = paths::child_ci(
+            &paths::child_ci(&game.data_dir(&data_root), "logs"),
+            "xcl.log",
+        );
+        let launched = SystemTime::now();
         let child = spawn_logged(cmd, &output, false)?;
         Ok(Running {
             game_id: game.id.clone(),
@@ -161,11 +172,25 @@ impl Running {
             child,
             started: Instant::now(),
             output,
+            shaders: RunShaders::default(),
+            xcl_log,
+            launched,
+            tail: LogTail::default(),
         })
     }
 
-    /// `Some` once the game has ended.
+    /// Takes in what XCL logged since the last poll; `Some` once the game has ended.
     pub fn poll(&mut self) -> Option<Finished> {
+        // XCL moves the previous run's log to xcl.prev.log when it starts: until then the file
+        // is the old one, which must not be read as this run's
+        let current = std::fs::metadata(&self.xcl_log)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t >= self.launched);
+        if current {
+            for line in self.tail.read_new(&self.xcl_log) {
+                self.shaders.parse_line(&line);
+            }
+        }
         match self.child.try_wait() {
             Ok(Some(status)) => Some(Finished {
                 name: self.name.clone(),
@@ -183,19 +208,22 @@ impl Running {
 
 /// Precompiling a game's shaders: `xcl shaders <pack> --precompile --only cs --pipelines` for
 /// each shader pack of the game, one after another (as `precompile-shaders-xcl-*.ps1` does).
+/// The compute pipelines are built on the GPU while their shaders are processed, so one counter
+/// covers both.
 pub struct Precompile {
     pub game_id: String,
     pub name: String,
     queue: VecDeque<PathBuf>,
     current: Option<(PathBuf, Child)>,
-    pub total: usize,
     pub output: PathBuf,
     pub used_only: bool,
+    pub progress: PrecompileProgress,
+    tail: LogTail,
 }
 
 /// Progress of a [`Precompile`] after a poll.
 pub enum PrecompileState {
-    Working { done: usize, pack: PathBuf },
+    Working,
     Done,
     Failed(String),
 }
@@ -230,24 +258,26 @@ impl Precompile {
         Precompile {
             game_id: game.id.clone(),
             name: game.name.clone(),
-            total: packs.len(),
+            progress: PrecompileProgress::new(packs.len()),
             queue: packs.into(),
             current: None,
             output: logs.join(format!("{}.precompile.log", game.title)),
             used_only,
+            tail: LogTail::default(),
         }
     }
 
-    /// Advances the job: starts the next pack when the current one is done.
+    /// Advances the job: reads XCL's progress from its output and starts the next pack when
+    /// the current one is done.
     pub fn poll(&mut self, cfg: &AppConfig) -> PrecompileState {
         if let Some((pack, child)) = &mut self.current {
-            match child.try_wait() {
-                Ok(None) => {
-                    return PrecompileState::Working {
-                        done: self.total - self.queue.len() - 1,
-                        pack: pack.clone(),
-                    };
-                }
+            let exited = child.try_wait();
+            // read after try_wait: a pack that has just ended has written all of its output
+            for line in self.tail.read_new(&self.output) {
+                self.progress.parse_line(&line);
+            }
+            match exited {
+                Ok(None) => return PrecompileState::Working,
                 Ok(Some(status)) if status.success() => self.current = None,
                 Ok(Some(status)) => {
                     return PrecompileState::Failed(format!(
@@ -261,7 +291,7 @@ impl Precompile {
         let Some(pack) = self.queue.pop_front() else {
             return PrecompileState::Done;
         };
-        let first = self.total - self.queue.len() == 1;
+        let first = self.progress.pack == 0;
         let started = xcl_command(cfg).and_then(|mut cmd| {
             cmd.arg("shaders").arg(paths::to_xcl_path(&pack)).args([
                 "--precompile",
@@ -276,11 +306,13 @@ impl Precompile {
         });
         match started {
             Ok(child) => {
-                self.current = Some((pack.clone(), child));
-                PrecompileState::Working {
-                    done: self.total - self.queue.len() - 1,
-                    pack,
+                if first {
+                    // the log was just truncated
+                    self.tail = LogTail::default();
                 }
+                self.progress.start_pack(&pack);
+                self.current = Some((pack, child));
+                PrecompileState::Working
             }
             Err(e) => PrecompileState::Failed(format!("{e:#}")),
         }
@@ -292,6 +324,235 @@ impl Precompile {
             kill_tree(child, cfg);
         }
         self.current = None;
+    }
+}
+
+/// The shader and pipeline work of a running game, as XCL logs it in `xcl.log`:
+///
+/// - `the pipelines of N shader sets an earlier run used are built ahead of their first use`
+///   once at startup, then `K pipelines built ahead of their first use` at K = 1, 2, 4, 8 …
+///   (XCL logs powers of two only, so K is a lower bound).
+/// - `driver compile start #I` / `driver compile finish #I` around each large pipeline
+///   (smaller ones are not logged unless `XCL_PSO_TRACE=1`).
+/// - `compute PSO with the translated console CS (…)` for each compute pipeline made.
+#[derive(Debug, Default, Clone)]
+pub struct RunShaders {
+    /// Pipelines an earlier run used, which XCL builds ahead at startup.
+    pub warmup_total: Option<usize>,
+    /// At least this many of them are built.
+    pub warmup_built: usize,
+    /// Pipelines built so far in this run (compute ones, and graphics ones large enough to be logged).
+    pub built: usize,
+    /// Large pipelines in the driver's compiler right now.
+    compiling: std::collections::HashSet<u64>,
+}
+
+impl RunShaders {
+    fn parse_line(&mut self, line: &str) {
+        let Some(msg) = line.split_once("D3D12.X: ").map(|(_, m)| m.trim()) else {
+            return;
+        };
+        if let Some(rest) = msg.strip_prefix("the pipelines of ") {
+            if rest.contains("built ahead of their first use") {
+                self.warmup_total = rest.split_whitespace().next().and_then(|n| n.parse().ok());
+            }
+        } else if let Some(n) = msg
+            .strip_suffix(" pipelines built ahead of their first use")
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            self.warmup_built = self.warmup_built.max(n);
+        } else if let Some(rest) = msg.strip_prefix("driver compile start #") {
+            if let Some(id) = compile_id(rest) {
+                self.compiling.insert(id);
+            }
+        } else if let Some(rest) = msg.strip_prefix("driver compile finish #") {
+            if let Some(id) = compile_id(rest) {
+                self.compiling.remove(&id);
+            }
+            // compute pipelines are counted by their own line below
+            if rest.contains("graphics PSO") {
+                self.built += 1;
+            }
+        } else if msg.starts_with("compute PSO with the translated console CS") {
+            self.built += 1;
+        }
+    }
+
+    /// Large pipelines the driver is compiling right now.
+    pub fn compiling(&self) -> usize {
+        self.compiling.len()
+    }
+
+    /// The share of the startup warm-up known to be done (a lower bound), while there is one.
+    pub fn warmup_fraction(&self) -> Option<f32> {
+        let total = self.warmup_total.filter(|&t| t > 0)?;
+        Some((self.warmup_built as f32 / total as f32).min(1.0))
+    }
+}
+
+/// `1172: compute PSO, …` → 1172.
+fn compile_id(rest: &str) -> Option<u64> {
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// How long the shader count may stand still before the progress says XCL is on large shaders.
+const STALL: Duration = Duration::from_secs(30);
+
+/// How far a [`Precompile`] is, read from what `xcl shaders --precompile` prints:
+/// `precompiling N shaders into …` when a pack starts, `  D/N (T s)` every 200 shaders, and a
+/// summary (`compiled …`, `pipelines made on the GPU …`) when it ends.
+#[derive(Debug, Clone)]
+pub struct PrecompileProgress {
+    /// The pack being worked on, counting from 1 (0 before the first one starts).
+    pub pack: usize,
+    pub packs: usize,
+    pub pack_name: String,
+    /// Shaders of the current pack done so far.
+    pub done: usize,
+    /// Shaders in the current pack, once XCL has said.
+    pub total: Option<usize>,
+    pub started: Instant,
+    /// XCL's summary lines of the finished packs.
+    pub summary: Vec<String>,
+    /// Pipelines built on the GPU in the current pack (`  pipelines: N made, M refused`, every 25).
+    pub pipelines_made: usize,
+    pub pipelines_refused: usize,
+    /// When the shader count last moved: XCL reports it every 200 shaders, and the biggest
+    /// programs can take minutes each.
+    pub last_count: Instant,
+}
+
+impl PrecompileProgress {
+    pub fn new(packs: usize) -> Self {
+        PrecompileProgress {
+            pack: 0,
+            packs,
+            pack_name: String::new(),
+            done: 0,
+            total: None,
+            started: Instant::now(),
+            summary: Vec::new(),
+            pipelines_made: 0,
+            pipelines_refused: 0,
+            last_count: Instant::now(),
+        }
+    }
+
+    fn start_pack(&mut self, pack: &Path) {
+        self.pack += 1;
+        self.pack_name = pack
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.done = 0;
+        self.total = None;
+        self.pipelines_made = 0;
+        self.pipelines_refused = 0;
+        self.last_count = Instant::now();
+    }
+
+    fn parse_line(&mut self, line: &str) {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("precompiling ") {
+            if let Some(n) = rest.split_whitespace().next().and_then(|n| n.parse().ok()) {
+                self.total = Some(n);
+                self.done = 0;
+            }
+        } else if line.starts_with("compiled ") {
+            if let Some(n) = self.total {
+                self.done = n;
+            }
+            self.summary.push(line.to_owned());
+        } else if let Some(rest) = line.strip_prefix("pipelines: ") {
+            // "150 made, 0 refused"
+            let mut numbers = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|n| n.parse().ok());
+            if let (Some(made), Some(refused)) = (numbers.next(), numbers.next()) {
+                self.pipelines_made = made;
+                self.pipelines_refused = refused;
+            }
+        } else if line.starts_with("pipelines made on the GPU") {
+            self.summary.push(line.to_owned());
+        } else if let Some((done, total)) = line
+            .split_whitespace()
+            .next()
+            .and_then(|t| t.split_once('/'))
+            .and_then(|(d, n)| Some((d.parse::<usize>().ok()?, n.parse::<usize>().ok()?)))
+        {
+            if done != self.done {
+                self.last_count = Instant::now();
+            }
+            self.done = done;
+            self.total = Some(total);
+        }
+    }
+
+    /// The share of the whole job that is done (0–1), once it can be told.
+    pub fn fraction(&self) -> Option<f32> {
+        if self.packs == 0 || self.pack == 0 {
+            return None;
+        }
+        let finished_packs = (self.pack - 1) as f32;
+        let in_pack = match self.total {
+            Some(0) => 1.0,
+            Some(n) => (self.done as f32 / n as f32).min(1.0),
+            None if self.pack > 1 => 0.0,
+            None => return None,
+        };
+        Some((finished_packs + in_pack) / self.packs as f32)
+    }
+
+    /// True when the shader count has not moved for a while: XCL is on its biggest programs.
+    pub fn on_large_shaders(&self) -> bool {
+        self.total.is_some() && self.last_count.elapsed() > STALL
+    }
+
+    /// An estimate of the time left, from the pace so far. `None` until there is enough to go by,
+    /// and while XCL is on large shaders (the pace says nothing then).
+    pub fn remaining(&self) -> Option<Duration> {
+        let f = self.fraction()?;
+        let elapsed = self.started.elapsed();
+        if !(0.01..1.0).contains(&f) || elapsed < Duration::from_secs(5) || self.on_large_shaders()
+        {
+            return None;
+        }
+        Some(elapsed.mul_f32((1.0 - f) / f))
+    }
+}
+
+/// Reads the lines a growing log file gets, from where the last read stopped.
+#[derive(Default)]
+struct LogTail {
+    pos: u64,
+    partial: String,
+}
+
+impl LogTail {
+    fn read_new(&mut self, path: &Path) -> Vec<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = File::open(path) else {
+            return Vec::new();
+        };
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(self.pos)).is_err() || f.read_to_end(&mut buf).is_err() {
+            return Vec::new();
+        }
+        self.pos += buf.len() as u64;
+        self.partial.push_str(&String::from_utf8_lossy(&buf));
+        // only whole lines: the rest waits for the next read
+        let Some(end) = self.partial.rfind(['\n', '\r']) else {
+            return Vec::new();
+        };
+        let complete: String = self.partial.drain(..=end).collect();
+        complete
+            .split(['\n', '\r'])
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_owned)
+            .collect()
     }
 }
 
@@ -307,4 +568,88 @@ pub fn xcl_is_running() -> bool {
         let name = p.name().to_string_lossy().to_ascii_lowercase();
         name == "xcl.exe" || name == "xcl"
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `xcl shaders --precompile --only cs --pipelines` prints for one pack.
+    const OUTPUT: &[&str] = &[
+        r"precompiling 26698 shaders into C:\Users\x\AppData\Local\xcl\dxil (30 compile threads; 4 memory windows)",
+        "  200/26698 (3 s)",
+        "  13400/26698 (95 s)",
+        "compiled 120, already cached 3000, errors 0, skipped (GS – paired at pipeline creation) 0, time 190.0 s",
+        "pipelines made on the GPU 118, refused 2",
+        "pipelines loaded from the driver cache 3000",
+    ];
+
+    #[test]
+    fn follows_xcl_progress_lines() {
+        let mut p = PrecompileProgress::new(2);
+        assert_eq!(p.fraction(), None);
+        p.start_pack(Path::new("a/shaders.rpf"));
+        assert_eq!(p.fraction(), None);
+        p.parse_line(OUTPUT[0]);
+        assert_eq!((p.done, p.total), (0, Some(26698)));
+        p.parse_line(OUTPUT[2]);
+        assert_eq!(p.done, 13400);
+        p.parse_line("  pipelines: 175 made, 2 refused");
+        assert_eq!((p.pipelines_made, p.pipelines_refused), (175, 2));
+        assert!((p.fraction().unwrap() - 0.25).abs() < 0.01);
+        for l in &OUTPUT[3..] {
+            p.parse_line(l);
+        }
+        assert_eq!(p.done, 26698);
+        assert_eq!(p.summary.len(), 2);
+        assert!((p.fraction().unwrap() - 0.5).abs() < 0.001);
+        p.start_pack(Path::new("b/shaders.rpf"));
+        assert!((p.fraction().unwrap() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn follows_shader_work_in_xcl_log() {
+        let log = [
+            "[    6.525][27384][INFO ] D3D12.X: 1 driver pipelines stand in for the pipelines not built yet",
+            "[    6.525][27384][INFO ] D3D12.X: the pipelines of 787 shader sets an earlier run used are built ahead of their first use",
+            "[    6.544][51116][INFO ] D3D12.X: 2 pipelines built ahead of their first use",
+            "[    8.743][37940][INFO ] D3D12.X: 512 pipelines built ahead of their first use",
+            "[    9.975][38844][INFO ] D3D12.X: compute PSO with the translated console CS (473776 B DXIL, 114 ms, the driver's blob of an earlier build)",
+            "[  921.182][48028][INFO ] D3D12.X: driver compile start #1164: graphics PSO, 305900 B DXIL, record 0123456789abcdef, driver blob absent",
+            "[ 1007.055][48652][INFO ] D3D12.X: driver compile start #1172: compute PSO, 349204 B DXIL, record fedcba9876543210, driver blob absent",
+            "[  927.674][48028][INFO ] D3D12.X: driver compile finish #1164: graphics PSO, 305900 B DXIL, 6492 ms, huge, ungated here",
+        ];
+        let mut s = RunShaders::default();
+        for l in log {
+            s.parse_line(l);
+        }
+        assert_eq!(s.warmup_total, Some(787));
+        assert_eq!(s.warmup_built, 512);
+        assert!((s.warmup_fraction().unwrap() - 512.0 / 787.0).abs() < 1e-6);
+        assert_eq!(s.built, 2);
+        assert_eq!(s.compiling(), 1);
+        s.parse_line("[ 1009.000][48652][INFO ] D3D12.X: driver compile finish #1172: compute PSO, 349204 B DXIL, 900 ms, gated (waited 3 ms)");
+        assert_eq!(s.compiling(), 0);
+        assert_eq!(
+            s.built, 2,
+            "compute pipelines are counted once, by their own line"
+        );
+    }
+
+    #[test]
+    fn reads_only_complete_new_lines() {
+        let path =
+            std::env::temp_dir().join(format!("xcl-launcher-tail-{}.log", std::process::id()));
+        std::fs::write(&path, "precompiling 10 shaders\n  2/10 (1 s)\n  4/1").unwrap();
+        let mut tail = LogTail::default();
+        assert_eq!(
+            tail.read_new(&path),
+            vec!["precompiling 10 shaders", "  2/10 (1 s)"]
+        );
+        let mut f = File::options().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, b"0 (2 s)\r\n").unwrap();
+        drop(f);
+        assert_eq!(tail.read_new(&path), vec!["  4/10 (2 s)"]);
+        std::fs::remove_file(&path).unwrap();
+    }
 }

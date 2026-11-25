@@ -52,11 +52,6 @@ struct Notice {
     path: Option<PathBuf>,
 }
 
-struct PrecompileJob {
-    job: Precompile,
-    status: String,
-}
-
 enum CleanState {
     Scanning(Receiver<Vec<Target>>),
     Choose(Vec<Target>),
@@ -78,7 +73,7 @@ pub struct App {
     filter: String,
     view: View,
     running: Vec<Running>,
-    precompiles: Vec<PrecompileJob>,
+    precompiles: Vec<Precompile>,
     notices: Vec<Notice>,
     clean: Option<CleanState>,
     /// Asked before precompiling: only the pipelines earlier runs used.
@@ -214,28 +209,23 @@ impl App {
 
         let mut messages = Vec::new();
         let cfg = &self.config;
-        self.precompiles.retain_mut(|p| match p.job.poll(cfg) {
-            PrecompileState::Working { done, pack } => {
-                let pack = pack
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                p.status = format!("pack {} of {} ({pack})", done + 1, p.job.total);
-                true
-            }
+        self.precompiles.retain_mut(|p| match p.poll(cfg) {
+            PrecompileState::Working => true,
             PrecompileState::Done => {
+                let took = format_duration(p.progress.started.elapsed());
+                let summary = p.progress.summary.join("; ");
                 messages.push((
-                    format!("Shaders of {} precompiled.", p.job.name),
+                    format!("Shaders of {} precompiled in {took}. {summary}", p.name),
                     false,
-                    None,
+                    Some(p.output.clone()),
                 ));
                 false
             }
             PrecompileState::Failed(e) => {
                 messages.push((
-                    format!("Precompiling {} failed: {e}", p.job.name),
+                    format!("Precompiling {} failed: {e}", p.name),
                     true,
-                    Some(p.job.output.clone()),
+                    Some(p.output.clone()),
                 ));
                 false
             }
@@ -288,10 +278,10 @@ impl App {
             Action::StopPrecompile(id) => {
                 let cfg = &self.config;
                 self.precompiles.retain_mut(|p| {
-                    if p.job.game_id == id {
-                        p.job.stop(cfg);
+                    if p.game_id == id {
+                        p.stop(cfg);
                     }
-                    p.job.game_id != id
+                    p.game_id != id
                 });
             }
             Action::Open(path) => self.open(&path),
@@ -360,7 +350,7 @@ impl App {
     }
 
     fn precompile(&mut self, id: &str, used_only: bool) {
-        if self.precompiles.iter().any(|p| p.job.game_id == id) {
+        if self.precompiles.iter().any(|p| p.game_id == id) {
             return;
         }
         let Some(game) = self.game(id).cloned() else {
@@ -384,10 +374,7 @@ impl App {
             false,
             Some(job.output.clone()),
         );
-        self.precompiles.push(PrecompileJob {
-            job,
-            status: "starting".into(),
-        });
+        self.precompiles.push(job);
     }
 
     fn open(&mut self, path: &Path) {
@@ -529,10 +516,18 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(&n.text).color(color)).truncate());
             });
         }
+        for r in &self.running {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} is running", r.name));
+                run_shaders_bar(ui, &r.shaders, 260.0, true);
+                ui.label(RichText::new(run_shaders_detail(&r.shaders)).weak());
+            });
+        }
         for p in &self.precompiles {
             ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("Precompiling {}: {}", p.job.name, p.status));
+                ui.label(format!("Precompiling {}", p.name));
+                precompile_bar(ui, &p.progress, 260.0);
+                ui.label(RichText::new(precompile_detail(&p.progress)).weak());
             });
         }
         if let Some(i) = dismiss {
@@ -612,7 +607,9 @@ impl App {
         let game = &self.games[index];
         let id = game.id.clone();
         let selected = self.selected.as_deref() == Some(id.as_str());
-        let running = self.running.iter().any(|r| r.game_id == id);
+        let run = self.running.iter().find(|r| r.game_id == id);
+        let running = run.is_some();
+        let compiling = run.is_some_and(|r| r.shaders.compiling() > 0);
         let radius = CornerRadius::same(8);
 
         if ui.is_rect_visible(rect) {
@@ -677,17 +674,22 @@ impl App {
             if running {
                 let badge = Rect::from_min_size(
                     rect.left_top() + Vec2::new(8.0, 8.0),
-                    Vec2::new(70.0, 22.0),
+                    Vec2::new(if compiling { 140.0 } else { 70.0 }, 22.0),
                 );
-                painter.rect_filled(
-                    badge,
-                    CornerRadius::same(11),
-                    Color32::from_rgb(30, 140, 70),
-                );
+                let color = if compiling {
+                    Color32::from_rgb(170, 110, 20)
+                } else {
+                    Color32::from_rgb(30, 140, 70)
+                };
+                painter.rect_filled(badge, CornerRadius::same(11), color);
                 painter.text(
                     badge.center(),
                     Align2::CENTER_CENTER,
-                    "Running",
+                    if compiling {
+                        "Compiling shaders"
+                    } else {
+                        "Running"
+                    },
                     FontId::proportional(13.0),
                     Color32::WHITE,
                 );
@@ -746,7 +748,7 @@ impl App {
             return;
         };
         let running = self.is_running(&id);
-        let precompiling = self.precompiles.iter().any(|p| p.job.game_id == id);
+        let precompiling = self.precompiles.iter().any(|p| p.game_id == id);
 
         ui.horizontal(|ui| {
             ui.heading(RichText::new(&game.name).strong());
@@ -792,6 +794,13 @@ impl App {
                 .small()
                 .weak(),
             );
+            ui.add_space(4.0);
+            run_shaders_bar(ui, &r.shaders, ui.available_width(), false);
+            ui.label(RichText::new(run_shaders_detail(&r.shaders)).small().weak())
+                .on_hover_text(
+                    "From xcl.log. XCL reports the pipelines it builds ahead at 1, 2, 4, 8 … \
+                     only, and logs large pipelines' compiles only, so these are lower bounds.",
+                );
         }
         ui.add_space(8.0);
 
@@ -850,6 +859,11 @@ impl App {
         ui.add_space(8.0);
 
         ui.label(RichText::new("Shaders").strong());
+        if let Some(p) = self.precompiles.iter().find(|p| p.game_id == id) {
+            precompile_bar(ui, &p.progress, ui.available_width());
+            ui.label(RichText::new(precompile_detail(&p.progress)).small().weak());
+            ui.add_space(4.0);
+        }
         ui.horizontal_wrapped(|ui| {
             if precompiling {
                 if ui.button("Stop precompiling").clicked() {
@@ -1227,7 +1241,7 @@ impl eframe::App for App {
             self.top_bar(ui, &mut actions);
             ui.add_space(6.0);
         });
-        if !self.notices.is_empty() || !self.precompiles.is_empty() {
+        if !self.notices.is_empty() || !self.precompiles.is_empty() || !self.running.is_empty() {
             egui::Panel::bottom("status").show(ui, |ui| {
                 ui.add_space(4.0);
                 self.status_bar(ui);
@@ -1302,6 +1316,115 @@ fn error_line(path: &Path) -> Option<String> {
     reason
         .or_else(|| lines.next())
         .map(|l| l.chars().take(240).collect())
+}
+
+/// A progress bar for a shader precompile: the share done and, while it is not known yet, an
+/// animated bar.
+fn precompile_bar(ui: &mut Ui, p: &crate::process::PrecompileProgress, width: f32) {
+    let bar = match p.fraction() {
+        Some(f) => egui::ProgressBar::new(f).text(format!("{:.0} %", f * 100.0)),
+        None => egui::ProgressBar::new(0.0).text("Starting…"),
+    };
+    // the spinner shows XCL is at work while the count stands still (it moves every 200 shaders)
+    ui.horizontal(|ui| {
+        let spinner = ui.spacing().interact_size.y;
+        ui.add(bar.desired_width((width - spinner - ui.spacing().item_spacing.x).max(40.0)));
+        ui.spinner();
+    });
+}
+
+/// The shader work of a running game: the startup warm-up as a bar (a lower bound: XCL logs
+/// it at powers of two), else an activity bar while large pipelines compile.
+/// `compact`: the short texts for the status bar.
+fn run_shaders_bar(ui: &mut Ui, s: &crate::process::RunShaders, width: f32, compact: bool) {
+    let (built, total) = (
+        group_digits(s.warmup_built),
+        group_digits(s.warmup_total.unwrap_or_default()),
+    );
+    let bar = match s.warmup_fraction() {
+        Some(f) if f < 1.0 => egui::ProgressBar::new(f).text(if compact {
+            format!("Warm-up: {built}+ of {total}")
+        } else {
+            format!("Building pipelines from earlier runs: at least {built} of {total}")
+        }),
+        Some(_) => egui::ProgressBar::new(1.0).text(if compact {
+            "Warm-up done"
+        } else {
+            "Pipelines from earlier runs built"
+        }),
+        None if s.compiling() > 0 => egui::ProgressBar::new(0.0).text("Compiling shaders"),
+        None => egui::ProgressBar::new(0.0).text(if compact {
+            "No shader work yet"
+        } else {
+            "No shader work logged yet"
+        }),
+    };
+    ui.horizontal(|ui| {
+        let spinner = ui.spacing().interact_size.y;
+        ui.add(bar.desired_width((width - spinner - ui.spacing().item_spacing.x).max(40.0)));
+        if s.compiling() > 0 {
+            ui.spinner();
+        }
+    });
+}
+
+/// "1,234 pipelines built · 2 large ones compiling now"
+fn run_shaders_detail(s: &crate::process::RunShaders) -> String {
+    let mut parts = vec![format!("{} pipelines built", group_digits(s.built))];
+    match s.compiling() {
+        0 => {}
+        1 => parts.push("1 large one compiling now".into()),
+        n => parts.push(format!("{n} large ones compiling now")),
+    }
+    parts.join(" · ")
+}
+
+/// "Pack 1 of 2 · 13,400 / 26,698 shaders · 3m 10s · about 3m 05s left"
+fn precompile_detail(p: &crate::process::PrecompileProgress) -> String {
+    let mut parts = Vec::new();
+    if p.packs > 1 {
+        parts.push(format!("Pack {} of {}", p.pack.max(1), p.packs));
+    }
+    if let Some(total) = p.total {
+        parts.push(format!(
+            "{} / {} shaders",
+            group_digits(p.done),
+            group_digits(total)
+        ));
+    } else {
+        parts.push("Reading the shader pack".into());
+    }
+    if p.pipelines_made + p.pipelines_refused > 0 {
+        let refused = if p.pipelines_refused > 0 {
+            format!(", {} refused", group_digits(p.pipelines_refused))
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "{} pipelines built{refused}",
+            group_digits(p.pipelines_made)
+        ));
+    }
+    parts.push(format_duration(p.started.elapsed()));
+    if p.on_large_shaders() {
+        parts.push("compiling large shaders, this can take minutes".into());
+    } else if let Some(left) = p.remaining() {
+        parts.push(format!("about {} left", format_duration(left)));
+    }
+    parts.join(" · ")
+}
+
+/// 26698 → "26,698".
+fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn format_duration(d: Duration) -> String {
