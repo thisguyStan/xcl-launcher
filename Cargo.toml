@@ -1,0 +1,28 @@
+[package]
+name = "xcl-launcher"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A small game library and launcher for XCL, the Xbox Series X|S compatibility layer"
+repository = "https://github.com/thisguyStan/xcl-launcher"
+publish = false
+
+[dependencies]
+anyhow = "1.0.105"
+directories = "6.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+open = "5.4.5"
+quick-xml = "0.42.0"
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+serde = { version = "1.0.229", features = ["derive"] }
+shlex = "2.0.1"
+sysinfo = { version = "0.40.4", default-features = false, features = ["system"] }
+toml = "1.2.3"
+toml_edit = "0.25.21"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
