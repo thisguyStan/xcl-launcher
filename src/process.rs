@@ -335,8 +335,13 @@ impl Precompile {
 /// - `driver compile start #I` / `driver compile finish #I` around each large pipeline
 ///   (smaller ones are not logged unless `XCL_PSO_TRACE=1`).
 /// - `compute PSO with the translated console CS (…)` for each compute pipeline made.
+///
+/// Before that, XCL prepares the shaders in the game window before the title starts
+/// ([`Preparation`]).
 #[derive(Debug, Default, Clone)]
 pub struct RunShaders {
+    /// The shader preparation before the title starts, once XCL has logged it.
+    pub preparation: Option<Preparation>,
     /// Pipelines an earlier run used, which XCL builds ahead at startup.
     pub warmup_total: Option<usize>,
     /// At least this many of them are built.
@@ -349,9 +354,19 @@ pub struct RunShaders {
 
 impl RunShaders {
     fn parse_line(&mut self, line: &str) {
+        if let Some(i) = line.find("Shader preparation") {
+            self.preparation
+                .get_or_insert_with(Preparation::default)
+                .parse(line[i..].trim_end(), log_seconds(line));
+            return;
+        }
         let Some(msg) = line.split_once("D3D12.X: ").map(|(_, m)| m.trim()) else {
             return;
         };
+        // the title's own work begins once preparation has ended
+        if let Some(p) = &mut self.preparation {
+            p.end.get_or_insert(PreparationEnd::Done);
+        }
         if let Some(rest) = msg.strip_prefix("the pipelines of ") {
             if rest.contains("built ahead of their first use") {
                 self.warmup_total = rest.split_whitespace().next().and_then(|n| n.parse().ok());
@@ -383,11 +398,177 @@ impl RunShaders {
         self.compiling.len()
     }
 
+    /// The shader preparation, while it is still going.
+    pub fn preparing(&self) -> Option<&Preparation> {
+        self.preparation.as_ref().filter(|p| p.end.is_none())
+    }
+
     /// The share of the startup warm-up known to be done (a lower bound), while there is one.
     pub fn warmup_fraction(&self) -> Option<f32> {
         let total = self.warmup_total.filter(|&t| t > 0)?;
         Some((self.warmup_built as f32 / total as f32).min(1.0))
     }
+}
+
+/// The step of XCL's shader preparation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PreparationStep {
+    /// Translating the console shaders (`records translated`).
+    #[default]
+    Translating,
+    /// Building compute pipelines in worker processes (`records checked for pipelines`).
+    Compute,
+    /// Building the graphics pipelines earlier runs used (`graphics pipelines built`).
+    Graphics,
+}
+
+/// How XCL's shader preparation ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparationEnd {
+    Done,
+    /// `XCL_PREPARE=0`
+    LeftOut,
+    Failed(String),
+}
+
+/// XCL's shader preparation before the title starts (XCL's `nvidia-dev` branch), from the
+/// `Shader preparation: …` lines in `xcl.log`. XCL logs the count every 5 seconds:
+/// `D of T records translated after S s`, `D of T records checked for pipelines by N workers
+/// after S s`, then `D of T graphics pipelines built by N workers after S s`.
+#[derive(Debug, Default, Clone)]
+pub struct Preparation {
+    pub step: PreparationStep,
+    pub done: usize,
+    pub total: usize,
+    /// Worker processes of the current step (0 while translating).
+    pub workers: usize,
+    /// Seconds since preparation began, as XCL logged them.
+    pub seconds: f64,
+    /// When the count last moved, in the same seconds.
+    moved_at: f64,
+    /// `only the N shaders earlier runs used`.
+    pub only_used: Option<usize>,
+    /// How long the compute pipelines took, once done.
+    pub compute_seconds: Option<u64>,
+    /// `graphics pipelines done in …: N made, M failed; …`, once done.
+    pub graphics_summary: Option<String>,
+    pub end: Option<PreparationEnd>,
+}
+
+impl Preparation {
+    /// `msg` starts at "Shader preparation"; `at` is the line's time stamp in the log.
+    fn parse(&mut self, msg: &str, at: Option<f64>) {
+        if let Some(at) = at {
+            self.seconds = self.seconds.max(at);
+        }
+        if msg.contains("Shader preparation cancelled")
+            || msg.contains("Shader preparation stopped")
+        {
+            self.end = Some(PreparationEnd::Failed(msg.to_string()));
+            return;
+        }
+        if msg.starts_with("Shader preparation left out") {
+            self.end = Some(PreparationEnd::LeftOut);
+            return;
+        }
+        let Some(rest) = msg.strip_prefix("Shader preparation: ") else {
+            return;
+        };
+        if let Some(n) = rest.strip_prefix("only the ") {
+            self.only_used = leading_number(n);
+        } else if let Some(w) = rest.strip_prefix("compute pipelines in ") {
+            self.set_step(PreparationStep::Compute, leading_number(w));
+        } else if let Some(s) = rest.strip_prefix("compute pipelines done in ") {
+            self.compute_seconds = leading_number(s).map(|n| n as u64);
+        } else if let Some(s) = rest
+            .strip_prefix("the ")
+            .filter(|s| s.contains("graphics pipelines earlier runs used"))
+        {
+            let workers = s.split_once(", in ").and_then(|(_, w)| leading_number(w));
+            self.set_step(PreparationStep::Graphics, workers);
+            self.total = leading_number(s).unwrap_or(self.total);
+        } else if let Some(s) = rest.strip_prefix("graphics pipelines done in ") {
+            self.graphics_summary =
+                Some(s.split_once("; driver").map_or(s, |(a, _)| a).to_string());
+            self.end = Some(PreparationEnd::Done);
+        } else if rest.starts_with("graphics pipelines left out")
+            || rest.starts_with("no graphics pipelines")
+        {
+            self.end = Some(PreparationEnd::Done);
+        } else if let Some((counts, tail)) = rest.split_once(" after ") {
+            // "D of T <what>" + "S s"
+            let mut words = counts.split_whitespace();
+            let (Some(done), Some("of"), Some(total)) = (
+                words.next().and_then(|n| n.parse().ok()),
+                words.next(),
+                words.next().and_then(|n| n.parse().ok()),
+            ) else {
+                return;
+            };
+            let what: Vec<&str> = words.collect();
+            let workers = what
+                .iter()
+                .position(|&w| w == "by")
+                .and_then(|i| what.get(i + 1))
+                .and_then(|n| n.parse().ok());
+            let step = if what.first() == Some(&"graphics") {
+                PreparationStep::Graphics
+            } else if what.contains(&"checked") {
+                PreparationStep::Compute
+            } else {
+                PreparationStep::Translating
+            };
+            self.set_step(step, workers);
+            if done != self.done || total != self.total {
+                self.moved_at = self.seconds;
+            }
+            self.done = done;
+            self.total = total;
+            if let Some(s) = leading_number(tail) {
+                self.seconds = self.seconds.max(s as f64);
+            }
+        }
+    }
+
+    fn set_step(&mut self, step: PreparationStep, workers: Option<usize>) {
+        if step != self.step {
+            self.step = step;
+            self.done = 0;
+            self.moved_at = self.seconds;
+        }
+        if let Some(w) = workers {
+            self.workers = w;
+        }
+    }
+
+    /// The share of the current step that is done.
+    pub fn fraction(&self) -> Option<f32> {
+        (self.total > 0).then(|| (self.done as f32 / self.total as f32).min(1.0))
+    }
+
+    /// Seconds the count has stood still: XCL is on its biggest pipelines.
+    pub fn still_for(&self) -> f64 {
+        self.seconds - self.moved_at
+    }
+}
+
+/// `[  397.288][45356][INFO ] …` → 397.288.
+fn log_seconds(line: &str) -> Option<f64> {
+    line.strip_prefix('[')?
+        .split_once(']')?
+        .0
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `1302 shaders …` → 1302.
+fn leading_number(s: &str) -> Option<usize> {
+    s.trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// `1172: compute PSO, …` → 1172.
@@ -634,6 +815,65 @@ mod tests {
             s.built, 2,
             "compute pipelines are counted once, by their own line"
         );
+    }
+
+    #[test]
+    fn follows_shader_preparation() {
+        let log = [
+            "[    0.005][ 5092][INFO ] Shader preparation: only the 1302 shaders earlier runs used (XCL_PREPARE_ALL=1: every record)",
+            "[    0.051][ 5092][INFO ] Shader preparation window 0x3d0ac8",
+            "[    5.092][42396][INFO ] Shader preparation: 23843 of 26503 records translated after 5 s",
+        ];
+        let mut s = RunShaders::default();
+        for l in log {
+            s.parse_line(l);
+        }
+        let p = s.preparing().unwrap();
+        assert_eq!(p.only_used, Some(1302));
+        assert_eq!(
+            (p.step, p.done, p.total),
+            (PreparationStep::Translating, 23843, 26503)
+        );
+        for l in [
+            "[    5.477][45356][INFO ] Shader preparation: compute pipelines in 20 worker processes, those an earlier run used",
+            "[   45.302][42396][INFO ] Shader preparation: 25806 of 26503 records checked for pipelines by 20 workers after 45 s",
+            "[   50.309][42396][INFO ] Shader preparation: 25806 of 26503 records checked for pipelines by 20 workers after 50 s",
+            "[  186.440][42396][INFO ] Shader preparation: 25806 of 26503 records checked for pipelines by 20 workers after 186 s",
+        ] {
+            s.parse_line(l);
+        }
+        let p = s.preparing().unwrap();
+        assert_eq!(
+            (p.step, p.done, p.workers),
+            (PreparationStep::Compute, 25806, 20)
+        );
+        assert!((p.still_for() - 141.0).abs() < 1.0, "{}", p.still_for());
+        for l in [
+            "[  397.288][45356][INFO ] Shader preparation: compute pipelines done in 392 s (0 of 20 workers failed)",
+            "[  397.355][45356][INFO ] Shader preparation: 2 of 147 graphics pipelines left out (their shaders are not in the title's shader files)",
+            "[  397.394][45356][INFO ] Shader preparation: the 145 graphics pipelines earlier runs used, in 20 worker processes",
+            "[  403.032][42396][INFO ] Shader preparation: 64 of 145 graphics pipelines built by 20 workers after 402 s",
+        ] {
+            s.parse_line(l);
+        }
+        let p = s.preparing().unwrap();
+        assert_eq!(
+            (p.step, p.done, p.total),
+            (PreparationStep::Graphics, 64, 145)
+        );
+        assert_eq!(p.compute_seconds, Some(392));
+        s.parse_line("[  440.292][45356][INFO ] Shader preparation: graphics pipelines done in 43 s: 145 made, 0 failed; driver blobs: 56 from disk, 89 kept (0 of 20 workers failed)");
+        assert!(s.preparing().is_none());
+        let p = s.preparation.as_ref().unwrap();
+        assert_eq!(p.end, Some(PreparationEnd::Done));
+        assert_eq!(
+            p.graphics_summary.as_deref(),
+            Some("43 s: 145 made, 0 failed")
+        );
+
+        let mut s = RunShaders::default();
+        s.parse_line("[    0.010][ 1][INFO ] Shader preparation left out (XCL_PREPARE=0): the title builds what it uses as it goes");
+        assert_eq!(s.preparation.unwrap().end, Some(PreparationEnd::LeftOut));
     }
 
     #[test]

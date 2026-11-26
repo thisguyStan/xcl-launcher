@@ -13,6 +13,10 @@ Xbox Series X|S → Windows compatibility layer.
 - **Shader precompiling** per game, the same as `precompile-shaders-xcl-*.ps1`.
 - Runs on **Windows** and **Linux** (there XCL runs under Wine or Proton).
 
+> **Tested with XCL's `nvidia-dev` branch.** The progress bars read the lines that branch writes
+> to `xcl.log` and prints from `xcl shaders --precompile`. Other XCL versions start games just
+> the same, but their shader progress may not show.
+
 ## Getting started
 
 1. **Build XCL** if you haven't yet (see XCL's README):
@@ -72,11 +76,31 @@ data folder (**Logs**).
 If XCL exits with an error, the bottom bar shows the reason (the `CRASH:` or `xcl:` line) with a
 **Show output** button.
 
+### Shader preparation before a game starts
+
+Before the game's own code starts, XCL prepares its shaders in the game window. The launcher reads
+the game's `xcl.log` as it grows and shows the same progress under **Stop** in the game's panel
+and in the bottom bar. The tile shows **Preparing shaders** meanwhile. There are three steps:
+
+1. **Translating shaders**: the console shaders are translated (records of the game's `shaders.rpf`).
+2. **Compute pipelines**: worker processes check every record and build its compute pipelines.
+3. **Graphics pipelines**: the graphics pipelines earlier runs used are built again from their
+   saved state.
+
+The bar shows the current step's count. XCL logs it every 5 seconds, so the bar moves in steps.
+After the first run, XCL only prepares the shaders earlier runs used, which is much faster.
+The count can stand still for minutes while the biggest pipelines are built: after 15 seconds
+without progress the panel says so, and the spinner shows XCL is still at work. Closing the game
+window cancels the launch.
+
+XCL's switches for this can be set as [environment variables](#game-settings-and-overrides):
+`XCL_PREPARE=0` leaves preparation out, `XCL_PREPARE_ALL=1` prepares every shader, not only the ones
+used before, and `XCL_PREPARE_GRAPHICS=0` leaves out the graphics pipelines.
+
 ### Shader compiling while a game runs
 
-XCL compiles shaders and builds pipelines on demand while a game runs. The launcher reads the
-game's `xcl.log` as it grows and shows that work under **Stop** in the game's panel and in the
-bottom bar:
+XCL still builds some pipelines while a game runs. Once preparation is done, the panel and
+bottom bar show how long it took and that work:
 
 - **Warm-up bar**: at startup, XCL builds the pipelines an earlier run used ("at least 512 of 787").
   XCL only logs this count at 1, 2, 4, 8 …, so the bar is a lower bound and usually stops short
@@ -85,8 +109,8 @@ bottom bar:
 - **Large ones compiling now**: pipelines in the GPU driver's compiler. While there are any, the
   tile shows **Compiling shaders** instead of **Running**.
 
-There's no overall percentage while playing: shaders are compiled the moment the game first needs
-them, so there's no total to measure against. Use **Precompile shaders** to do that work ahead of time.
+There's no overall percentage while playing: pipelines are built the moment the game first needs
+them, so there's no total to measure against.
 
 ## Settings
 
@@ -188,7 +212,10 @@ pipelines* is what **Only pipelines used before** depends on, so it's unticked u
 ## Precompiling shaders
 
 **Precompile shaders** in a game's panel compiles the game's compute shaders and pipelines into
-XCL's cache, so the first run doesn't wait for them. It runs
+XCL's cache without starting the game. XCL does this work in its [shader
+preparation](#shader-preparation-before-a-game-starts) on every launch anyway, so this is for
+getting it done ahead of time, for example right after updating XCL or cleaning the shader cache.
+It runs
 
 ```
 xcl shaders <pack> --precompile --only cs --pipelines [--used-only]

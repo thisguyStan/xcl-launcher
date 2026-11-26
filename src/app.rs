@@ -609,6 +609,7 @@ impl App {
         let selected = self.selected.as_deref() == Some(id.as_str());
         let run = self.running.iter().find(|r| r.game_id == id);
         let running = run.is_some();
+        let preparing = run.is_some_and(|r| r.shaders.preparing().is_some());
         let compiling = run.is_some_and(|r| r.shaders.compiling() > 0);
         let radius = CornerRadius::same(8);
 
@@ -674,9 +675,9 @@ impl App {
             if running {
                 let badge = Rect::from_min_size(
                     rect.left_top() + Vec2::new(8.0, 8.0),
-                    Vec2::new(if compiling { 140.0 } else { 70.0 }, 22.0),
+                    Vec2::new(if preparing || compiling { 140.0 } else { 70.0 }, 22.0),
                 );
-                let color = if compiling {
+                let color = if preparing || compiling {
                     Color32::from_rgb(170, 110, 20)
                 } else {
                     Color32::from_rgb(30, 140, 70)
@@ -685,7 +686,9 @@ impl App {
                 painter.text(
                     badge.center(),
                     Align2::CENTER_CENTER,
-                    if compiling {
+                    if preparing {
+                        "Preparing shaders"
+                    } else if compiling {
                         "Compiling shaders"
                     } else {
                         "Running"
@@ -796,11 +799,16 @@ impl App {
             );
             ui.add_space(4.0);
             run_shaders_bar(ui, &r.shaders, ui.available_width(), false);
+            let hover = if r.shaders.preparing().is_some() {
+                "From xcl.log. XCL prepares the shaders in the game window before the game \
+                 starts and logs how far it is every 5 seconds. Closing the game window \
+                 cancels the launch."
+            } else {
+                "From xcl.log. XCL reports the pipelines it builds ahead at 1, 2, 4, 8 … \
+                 only, and logs large pipelines' compiles only, so these are lower bounds."
+            };
             ui.label(RichText::new(run_shaders_detail(&r.shaders)).small().weak())
-                .on_hover_text(
-                    "From xcl.log. XCL reports the pipelines it builds ahead at 1, 2, 4, 8 … \
-                     only, and logs large pipelines' compiles only, so these are lower bounds.",
-                );
+                .on_hover_text(hover);
         }
         ui.add_space(8.0);
 
@@ -871,7 +879,7 @@ impl App {
                 }
             } else if ui
                 .add_enabled(!running && !game.missing, egui::Button::new("Precompile shaders"))
-                .on_hover_text("Compiles the game's compute shaders and pipelines ahead of time, so the first run does not wait for them. Resumable.")
+                .on_hover_text("Compiles the game's compute shaders and pipelines ahead of time, without starting the game. XCL also prepares them in the game window on every launch; this does that work now. Resumable.")
                 .clicked()
             {
                 actions.push(Action::Precompile { id: id.clone(), used_only: self.precompile_used_only });
@@ -1337,6 +1345,10 @@ fn precompile_bar(ui: &mut Ui, p: &crate::process::PrecompileProgress, width: f3
 /// it at powers of two), else an activity bar while large pipelines compile.
 /// `compact`: the short texts for the status bar.
 fn run_shaders_bar(ui: &mut Ui, s: &crate::process::RunShaders, width: f32, compact: bool) {
+    if let Some(p) = s.preparing() {
+        preparation_bar(ui, p, width, compact);
+        return;
+    }
     let (built, total) = (
         group_digits(s.warmup_built),
         group_digits(s.warmup_total.unwrap_or_default()),
@@ -1368,9 +1380,71 @@ fn run_shaders_bar(ui: &mut Ui, s: &crate::process::RunShaders, width: f32, comp
     });
 }
 
+/// XCL's shader preparation before the game starts: the current step's count as a bar.
+fn preparation_bar(ui: &mut Ui, p: &crate::process::Preparation, width: f32, compact: bool) {
+    use crate::process::PreparationStep;
+    let (n, what) = match p.step {
+        PreparationStep::Translating => (1, "translating shaders"),
+        PreparationStep::Compute => (2, "compute pipelines"),
+        PreparationStep::Graphics => (3, "graphics pipelines"),
+    };
+    let text = match p.fraction() {
+        Some(f) if compact => format!("Preparing {n}/3: {:.0} %", f * 100.0),
+        Some(f) => format!(
+            "Step {n} of 3, {what}: {} of {} ({:.0} %)",
+            group_digits(p.done),
+            group_digits(p.total),
+            f * 100.0
+        ),
+        None if compact => format!("Preparing {n}/3"),
+        None => format!("Step {n} of 3, {what}"),
+    };
+    let bar = egui::ProgressBar::new(p.fraction().unwrap_or(0.0)).text(text);
+    ui.horizontal(|ui| {
+        let spinner = ui.spacing().interact_size.y;
+        ui.add(bar.desired_width((width - spinner - ui.spacing().item_spacing.x).max(40.0)));
+        ui.spinner();
+    });
+}
+
+/// "Preparing shaders · 20 workers · 3m 06s · no progress for 2m 21s: large pipelines"
+fn preparation_detail(p: &crate::process::Preparation) -> String {
+    let mut parts = vec!["Preparing shaders before the game starts".to_string()];
+    if let Some(n) = p.only_used {
+        parts.push(format!("only the {} shaders used before", group_digits(n)));
+    }
+    if p.workers > 0 {
+        parts.push(format!("{} workers", p.workers));
+    }
+    parts.push(format_duration(Duration::from_secs_f64(p.seconds.max(0.0))));
+    let still = p.still_for();
+    if still >= 15.0 {
+        parts.push(format!(
+            "no progress for {}: building large pipelines",
+            format_duration(Duration::from_secs_f64(still))
+        ));
+    }
+    parts.join(" · ")
+}
+
 /// "1,234 pipelines built · 2 large ones compiling now"
 fn run_shaders_detail(s: &crate::process::RunShaders) -> String {
-    let mut parts = vec![format!("{} pipelines built", group_digits(s.built))];
+    if let Some(p) = s.preparing() {
+        return preparation_detail(p);
+    }
+    let mut parts = Vec::new();
+    if let Some(p) = &s.preparation {
+        use crate::process::PreparationEnd;
+        match &p.end {
+            Some(PreparationEnd::LeftOut) => parts.push("Preparation left out".to_string()),
+            Some(PreparationEnd::Failed(e)) => parts.push(e.clone()),
+            _ => parts.push(format!(
+                "Prepared in {}",
+                format_duration(Duration::from_secs_f64(p.seconds.max(0.0)))
+            )),
+        }
+    }
+    parts.push(format!("{} pipelines built", group_digits(s.built)));
     match s.compiling() {
         0 => {}
         1 => parts.push("1 large one compiling now".into()),
