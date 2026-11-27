@@ -120,7 +120,7 @@ pub fn launch_settings(ui: &mut Ui, id: &str, s: &mut LaunchSettings, level: Lev
                     .unwrap_or_else(|| "Player1".into()),
                 inherited(base.and_then(|b| b.gamertag.clone()), "Player1"),
                 |ui, tag| {
-                    ui.add(TextEdit::singleline(tag).desired_width(160.0));
+                    clipboard_menu(ui.add(TextEdit::singleline(tag).desired_width(160.0)));
                 },
             );
 
@@ -244,7 +244,7 @@ pub fn launch_settings(ui: &mut Ui, id: &str, s: &mut LaunchSettings, level: Lev
             base.and_then(|b| b.adapter.clone()).unwrap_or_else(|| "auto".into()),
             inherited(base.and_then(|b| b.adapter.clone()), "from xcl.toml (auto)"),
             |ui, a| {
-                ui.add(TextEdit::singleline(a).desired_width(160.0))
+                clipboard_menu(ui.add(TextEdit::singleline(a).desired_width(160.0)))
                     .on_hover_text("\"auto\", the adapter's number (1, 2, …) or part of its name (\"radeon\", \"nvidia\").");
             },
         );
@@ -278,7 +278,7 @@ pub fn launch_settings(ui: &mut Ui, id: &str, s: &mut LaunchSettings, level: Lev
             base.and_then(|b| b.game_args.clone()).unwrap_or_default(),
             inherited(base.and_then(|b| b.game_args.clone()), "none"),
             |ui, a| {
-                ui.add(TextEdit::singleline(a).desired_width(240.0).hint_text("-arg \"with space\""));
+                clipboard_menu(ui.add(TextEdit::singleline(a).desired_width(240.0).hint_text("-arg \"with space\"")));
             },
         );
     });
@@ -291,6 +291,46 @@ pub fn launch_settings(ui: &mut Ui, id: &str, s: &mut LaunchSettings, level: Lev
     env_editor(ui, id, s, base);
 
     *s != before
+}
+
+/// Adds a right-click menu with Cut, Copy and Paste to a text field (the keyboard shortcuts
+/// work in every text field anyway).
+pub fn clipboard_menu(field: egui::Response) -> egui::Response {
+    use egui::text_edit::TextEditState;
+    use egui::text_selection::CCursorRange;
+    // the right-click that opens the menu drops the field's selection: remember it while the
+    // field is being edited, and put it back before cutting or copying
+    let saved = field.id.with("clipboard_menu_selection");
+    let ctx = field.ctx.clone();
+    let right_click = ctx.input(|i| {
+        i.pointer.button_down(egui::PointerButton::Secondary)
+            || i.pointer.button_released(egui::PointerButton::Secondary)
+    });
+    if field.has_focus() && !right_click && !field.context_menu_opened() {
+        let range = TextEditState::load(&ctx, field.id).and_then(|s| s.cursor.char_range());
+        ctx.data_mut(|d| d.insert_temp::<Option<CCursorRange>>(saved, range));
+    }
+    field.context_menu(|ui| {
+        for (label, cmd) in [
+            ("Cut", egui::ViewportCommand::RequestCut),
+            ("Copy", egui::ViewportCommand::RequestCopy),
+            ("Paste", egui::ViewportCommand::RequestPaste),
+        ] {
+            if ui.button(label).clicked() {
+                if let Some(range) = ctx.data(|d| d.get_temp::<Option<CCursorRange>>(saved)) {
+                    let mut state = TextEditState::load(&ctx, field.id).unwrap_or_default();
+                    state.cursor.set_char_range(range);
+                    state.store(&ctx, field.id);
+                }
+                // the command arrives as a cut/copy/paste event for the focused field in the
+                // next frame
+                field.request_focus();
+                ctx.send_viewport_cmd(cmd);
+                ui.close();
+            }
+        }
+    });
+    field
 }
 
 fn env_editor(ui: &mut Ui, id: &str, s: &mut LaunchSettings, base: Option<&LaunchSettings>) {
@@ -308,29 +348,40 @@ fn env_editor(ui: &mut Ui, id: &str, s: &mut LaunchSettings, base: Option<&Launc
         }
     }
     let mut remove = None;
-    Grid::new((id, "envgrid"))
-        .num_columns(3)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            for (i, var) in s.env.iter_mut().enumerate() {
-                ui.add(
-                    TextEdit::singleline(&mut var.name)
-                        .desired_width(220.0)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("NAME"),
+    // the fields share the panel's width: name 40 %, value the rest, never narrower than
+    // what a typical `XCL_*` name needs
+    let font = egui::FontId::monospace(14.0);
+    for (i, var) in s.env.iter_mut().enumerate() {
+        ui.push_id((id, "env", i), |ui| {
+            ui.horizontal(|ui| {
+                let gap = ui.spacing().item_spacing.x;
+                let height = ui.spacing().interact_size.y.max(26.0);
+                let fields = (ui.available_width() - 80.0 - 2.0 * gap).max(320.0);
+                let name_w = (fields * 0.38).max(150.0);
+                clipboard_menu(
+                    ui.add_sized(
+                        [name_w, height],
+                        TextEdit::singleline(&mut var.name)
+                            .font(font.clone())
+                            .align(egui::Align2::LEFT_CENTER)
+                            .hint_text("NAME"),
+                    ),
                 );
-                ui.add(
-                    TextEdit::singleline(&mut var.value)
-                        .desired_width(220.0)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("value"),
+                clipboard_menu(
+                    ui.add_sized(
+                        [(fields - name_w).max(160.0), height],
+                        TextEdit::singleline(&mut var.value)
+                            .font(font.clone())
+                            .align(egui::Align2::LEFT_CENTER)
+                            .hint_text("value"),
+                    ),
                 );
-                if ui.small_button("Remove").clicked() {
+                if ui.button("Remove").clicked() {
                     remove = Some(i);
                 }
-                ui.end_row();
-            }
+            });
         });
+    }
     if let Some(i) = remove {
         s.env.remove(i);
     }

@@ -420,10 +420,12 @@ impl App {
             ui.heading(RichText::new("XCL Launcher").strong());
             ui.add_space(12.0);
             if self.view == View::Library {
-                ui.add(
-                    TextEdit::singleline(&mut self.filter)
-                        .hint_text("Search games")
-                        .desired_width(200.0),
+                crate::settings_ui::clipboard_menu(
+                    ui.add(
+                        TextEdit::singleline(&mut self.filter)
+                            .hint_text("Search games")
+                            .desired_width(200.0),
+                    ),
                 );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -734,6 +736,14 @@ impl App {
             {
                 actions.push(Action::Open(saves_dir(&data)));
             }
+            ui.separator();
+            // the tile's name is drawn, not a label, so it cannot be selected
+            if ui.button("Copy name").clicked() {
+                ui.ctx().copy_text(game.name.clone());
+            }
+            if ui.button("Copy folder path").clicked() {
+                ui.ctx().copy_text(game.root.display().to_string());
+            }
             if game.source == Source::Manual {
                 ui.separator();
                 if ui.button("Remove from list").clicked() {
@@ -950,7 +960,7 @@ impl App {
                 ui.label("xcl.exe");
                 ui.horizontal(|ui| {
                     let mut text = self.config.xcl_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                    if ui.add(TextEdit::singleline(&mut text).desired_width(460.0).hint_text("path to xcl.exe")).changed() {
+                    if crate::settings_ui::clipboard_menu(ui.add(TextEdit::singleline(&mut text).desired_width(460.0).hint_text("path to xcl.exe"))).changed() {
                         self.config.xcl_path = (!text.trim().is_empty()).then(|| PathBuf::from(text.trim()));
                     }
                     if ui.button("Browse…").clicked()
@@ -972,7 +982,7 @@ impl App {
                     let mut text = self.config.xcl_data_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                     let default = paths::xcl_data_root(&AppConfig { xcl_data_root: None, ..self.config.clone() });
                     let hint = default.map(|d| d.display().to_string()).unwrap_or_default();
-                    if ui.add(TextEdit::singleline(&mut text).desired_width(460.0).hint_text(hint)).on_hover_text("XCL_DATA_ROOT; leave empty for XCL's default").changed() {
+                    if crate::settings_ui::clipboard_menu(ui.add(TextEdit::singleline(&mut text).desired_width(460.0).hint_text(hint))).on_hover_text("XCL_DATA_ROOT; leave empty for XCL's default").changed() {
                         self.config.xcl_data_root = (!text.trim().is_empty()).then(|| PathBuf::from(text.trim()));
                     }
                     if ui.button("Browse…").clicked()
@@ -984,17 +994,17 @@ impl App {
 
                 if !cfg!(windows) {
                     ui.label("Runner");
-                    ui.add(TextEdit::singleline(&mut self.config.runner).desired_width(460.0).hint_text("wine"))
+                    crate::settings_ui::clipboard_menu(ui.add(TextEdit::singleline(&mut self.config.runner).desired_width(460.0).hint_text("wine")))
                         .on_hover_text("The program that runs xcl.exe: wine, a Proton script, umu-run …");
                     ui.end_row();
                     ui.label("Runner arguments");
-                    ui.add(TextEdit::singleline(&mut self.config.runner_args).desired_width(460.0).hint_text("e.g. run (for Proton)"));
+                    crate::settings_ui::clipboard_menu(ui.add(TextEdit::singleline(&mut self.config.runner_args).desired_width(460.0).hint_text("e.g. run (for Proton)")));
                     ui.end_row();
                     ui.label("Wine prefix");
                     ui.horizontal(|ui| {
                         let mut text = self.config.wine_prefix.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                         let hint = paths::wine_prefix(&AppConfig { wine_prefix: None, ..self.config.clone() }).display().to_string();
-                        if ui.add(TextEdit::singleline(&mut text).desired_width(460.0).hint_text(hint)).changed() {
+                        if crate::settings_ui::clipboard_menu(ui.add(TextEdit::singleline(&mut text).desired_width(460.0).hint_text(hint))).changed() {
                             self.config.wine_prefix = (!text.trim().is_empty()).then(|| PathBuf::from(text.trim()));
                         }
                         if ui.button("Browse…").clicked()

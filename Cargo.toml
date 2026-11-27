@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 anyhow = "1.0.105"
 directories = "6.0.0"
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard", "wayland", "x11"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 open = "5.4.5"
 quick-xml = "0.42.0"

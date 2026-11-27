@@ -67,6 +67,11 @@ The window only redraws when something changes, so the launcher stays light with
 | Stop | **Stop** in the panel or the tile's right-click menu. It ends XCL and the game process it started |
 | Game details | Click a tile. **Esc** closes the panel |
 | Search | The search box filters by name |
+| Copy a game's name or folder | Right-click the tile → **Copy name** / **Copy folder path** |
+
+**Copy and paste** work everywhere: every text field takes Ctrl+V / Ctrl+C / Ctrl+X and has a
+right-click menu with Cut, Copy and Paste. Any other text in the launcher (paths, error messages,
+settings) can be selected with the mouse and copied with Ctrl+C.
 
 XCL is started as `xcl run "<game folder>" [-- <game arguments>]` **without a console window**.
 What XCL prints to its console is saved to a file instead (**Console output** in the game's
